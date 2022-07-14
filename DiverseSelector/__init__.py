@@ -23,7 +23,11 @@
 
 """The main DiverseSelector Package."""
 
-from DiverseSelector.selectors import *
+from DiverseSelector.selectors import (DirectedSphereExclusion,
+                                       GridPartitioning,
+                                       MaxMin,
+                                       OptiSim,
+                                       )
 
 # Handle versioneer
 from ._version import get_versions
