@@ -120,7 +120,7 @@ def test_directedsphereexclusion():
     selector = DirectedSphereExclusion()
     selected_ids = selector.select(arr=coords_cluster, num_selected=12, labels=class_labels_cluster)
     # make sure all the selected indices are the same with expectation
-    assert_equal(selected_ids, [95, 14, 88, 84, 76, 68, 93, 50, 29, 19, 54])
+    assert_equal(selected_ids, [95, 14, 88, 84, 76, 49, 93, 50, 29, 27, 15, 54])
 
     selector = DirectedSphereExclusion()
     selected_ids = selector.select(arr=coords, num_selected=12)

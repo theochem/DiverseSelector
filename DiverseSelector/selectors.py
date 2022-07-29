@@ -26,7 +26,7 @@ import math
 from typing import Union
 
 import bitarray
-from DiverseSelector.base import SelectionBase
+from DiverseSelector.base import KDTreeBase, SelectionBase
 from DiverseSelector.diversity import compute_diversity
 import numpy as np
 from sklearn.decomposition import PCA
@@ -277,7 +277,7 @@ class OptiSim(SelectionBase):
         return predict_radius(self, arr, num_selected, cluster_ids)
 
 
-class DirectedSphereExclusion(SelectionBase):
+class DirectedSphereExclusion(KDTreeBase):
     """Selecting points using Directed Sphere Exclusion algorithm.
 
     Starting point is chosen as the reference point and not included in the selected molecules. The
@@ -315,6 +315,7 @@ class DirectedSphereExclusion(SelectionBase):
         self.func_distance = func_distance
         self.starting_idx = start_id
         self.random_seed = random_seed
+        self.BT = collections.namedtuple("BT", ["value", "index", "left", "right"])
 
     def algorithm(self, arr):
         """
@@ -331,30 +332,27 @@ class DirectedSphereExclusion(SelectionBase):
             List of ids of selected molecules
         """
         selected = []
-        ref = [self.starting_idx]
-        candidates = np.delete(np.arange(0, len(arr)), ref)
+        candidates = np.delete(np.arange(0, len(arr)), self.starting_idx)
         distances = []
         for idx in candidates:
-            ref_point = arr[ref[0]]
+            ref_point = arr[self.starting_idx]
             data_point = arr[idx]
             distance = self.func_distance(ref_point, data_point)
             distances.append((distance, idx))
         distances.sort()
         order = [idx for dist, idx in distances]
 
+        kdtree = self._kdtree(arr)
+        bv = bitarray.bitarray(len(arr))
+        bv[:] = 0
+        bv[self.starting_idx] = 1
+
         for idx in order:
-            if len(selected) == 0:
+            if not bv[idx]:
                 selected.append(idx)
-                continue
-            distances = []
-            for selected_idx in selected:
-                data_point = arr[idx]
-                selected_point = arr[selected_idx]
-                distance = self.func_distance(data_point, selected_point)
-                distances.append(distance)
-            min_dist = min(distances)
-            if min_dist > self.r:
-                selected.append(idx)
+                elim = self._find_nearest_neighbor(kdtree=kdtree, point=arr[idx], threshold=self.r)
+                for index in elim:
+                    bv[index] = 1
 
         return selected
 
@@ -543,7 +541,7 @@ class GridPartitioning(SelectionBase):
         return selected
 
 
-class KDTree(SelectionBase):
+class KDTree(KDTreeBase):
     """Selecting points using an algorithm adapted from KDTree.
 
     Points are initially used to construct a KDTree. Eucleidean distances are used for this
@@ -579,52 +577,10 @@ class KDTree(SelectionBase):
         self.func_distance = func_distance
         self.BT = collections.namedtuple("BT", ["value", "index", "left", "right"])
         self.FNRecord = collections.namedtuple("FNRecord", ["point", "index", "distance"])
-        self.scaling = scaling/100
+        self.scaling = scaling / 100
         self.ratio = None
 
-    def kdtree(self, arr):
-        """Construct a k-d tree from an iterable of points.
-
-        Parameters
-        ----------
-        arr: list
-            Coordinate array of points.
-
-        Returns
-        -------
-        kdtree: collections.namedtuple
-            KDTree organizing coordinates.
-        """
-
-        k = len(arr[0])
-
-        def build(points, depth, old_indices=None):
-            """Build a k-d tree from a set of points at a given depth."""
-            if len(points) == 0:
-                return None
-            middle = len(points) // 2
-            indices, points = zip(*sorted(enumerate(points), key=lambda x: x[1][depth % k]))
-            if old_indices is not None:
-                indices = [old_indices[i] for i in indices]
-            return self.BT(
-                value=points[middle],
-                index=indices[middle],
-                left=build(
-                    points=points[:middle],
-                    depth=depth + 1,
-                    old_indices=indices[:middle],
-                ),
-                right=build(
-                    points=points[middle + 1:],
-                    depth=depth + 1,
-                    old_indices=indices[middle + 1:],
-                ),
-            )
-
-        kdtree = build(points=arr, depth=0)
-        return kdtree
-
-    def find_furthest_neighbor(self, kdtree, point, selected_bitvector):
+    def _find_furthest_neighbor(self, kdtree, point, selected_bitvector):
         """Find approximately the furthest neighbor in a k-d tree for a given point.
 
         Parameters
@@ -675,86 +631,6 @@ class KDTree(SelectionBase):
         search(tree=kdtree, depth=0)
         return best
 
-    def find_nearest_neighbor(self, kdtree, point, furthest_distance_avg):
-        """
-        Find the nearest neighbors in a k-d tree for a point.
-
-        Parameters
-        ----------
-        kdtree: collections.namedtuple
-            KDTree organizing coordinates.
-        point: list
-            Query point for search.
-        furthest_distance_avg: float
-            The furthest average distance of previous queries.
-
-        Returns
-        -------
-        to_eliminate: list
-            A list containing all the indices of points too close to the newly selected point.
-        """
-        k = len(point)
-        scaled_avg = furthest_distance_avg * self.scaling
-        to_eliminate = []
-
-        def search(tree, depth):
-            # Recursively search through the k-d tree to find the
-            # nearest neighbor.
-
-            if tree is None:
-                return
-
-            distance = self.func_distance(tree.value, point)
-            if distance < scaled_avg:
-                to_eliminate.append((distance, tree.index))
-
-            axis = depth % k
-            diff = point[axis] - tree.value[axis]
-            if diff <= 0:
-                close, away = tree.left, tree.right
-            else:
-                close, away = tree.right, tree.left
-
-            search(tree=close, depth=depth + 1)
-            if diff ** 2 < scaled_avg:
-                search(tree=away, depth=depth + 1)
-
-        search(tree=kdtree, depth=0)
-        to_eliminate.sort()
-        to_eliminate.pop(0)
-        to_eliminate = [index for dist, index in to_eliminate]
-        return to_eliminate
-
-    def eliminate(self, tree, point, best_distance_av, num_eliminate, bv):
-        """Eliminates points from being selected in future rounds.
-
-        Parameters
-        ----------
-        tree: collections.namedtuple
-            KDTree organizing coordinates.
-        point: list
-            Point where close neighbors should be eliminated.
-        best_distance_av: float
-            An average of all the furthest distances found using find_furthest_neighbor
-        num_eliminate: int
-            Maximum number of points permitted to be eliminated.
-        bv: bitarray
-            Bitvector marking picked/eliminated points.
-
-        Returns
-        -------
-        num_eliminate: int
-            Maximum number of points permitted to be eliminated.
-        """
-        elim_candidates = self.find_nearest_neighbor(tree, point, best_distance_av)
-        elim_candidates = elim_candidates[:self.ratio]
-        num_eliminate -= len(elim_candidates)
-        if num_eliminate < 0:
-            elim_candidates = elim_candidates[:num_eliminate]
-        for index in elim_candidates:
-            bv[index] = 1
-        return num_eliminate
-
     def select_from_cluster(self, arr, num_selected, cluster_ids=None):
         """Main function for selecting points using the KDTree algorithm.
 
@@ -778,7 +654,8 @@ class KDTree(SelectionBase):
         if isinstance(arr, np.ndarray):
             arr = arr.tolist()
         arr_len = len(arr)
-        tree = self.kdtree(arr)
+        tree = self._kdtree(arr)
+
         bv = bitarray.bitarray(arr_len)
         bv[:] = 0
         selected = [self.starting_idx]
@@ -786,10 +663,10 @@ class KDTree(SelectionBase):
         bv[self.starting_idx] = 1
         count = 1
         num_eliminate = arr_len - num_selected
-        self.ratio = math.ceil(num_eliminate/num_selected)
+        self.ratio = math.ceil(num_eliminate / num_selected)
         best_distance_av = 0
         while len(selected) < num_selected:
-            new_point = self.find_furthest_neighbor(tree, query_point, bv)
+            new_point = self._find_furthest_neighbor(tree, query_point, bv)
             if new_point is None:
                 return selected
             selected.append(new_point.index)
@@ -802,11 +679,13 @@ class KDTree(SelectionBase):
                 best_distance_av = (count * best_distance_av + new_point.distance) / (count + 1)
             if count == 1:
                 if num_eliminate > 0 and self.scaling != 0:
-                    num_eliminate = self.eliminate(tree, arr[self.starting_idx], best_distance_av,
-                                                   num_eliminate, bv)
+                    num_eliminate = self._eliminate(tree, arr[self.starting_idx],
+                                                    best_distance_av * self.scaling,
+                                                    num_eliminate, bv)
             if num_eliminate > 0 and self.scaling != 0:
-                num_eliminate = self.eliminate(tree, new_point.point, best_distance_av,
-                                               num_eliminate, bv)
+                num_eliminate = self._eliminate(tree, new_point.point,
+                                                best_distance_av * self.scaling,
+                                                num_eliminate, bv)
             count += 1
         return selected
 
@@ -867,7 +746,7 @@ def predict_radius(obj: Union[DirectedSphereExclusion, OptiSim], arr, num_select
         else:
             bounds[1] = rg
         count += 1
-    if count == 20:
+    if count == 10:
         print(f"Optimal radius finder failed to converge, selected {len(result)} molecules instead "
               f"of requested {num_selected}.")
     obj.r = original_r
